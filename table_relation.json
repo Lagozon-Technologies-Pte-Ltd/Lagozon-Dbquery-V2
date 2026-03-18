@@ -2,43 +2,43 @@
   "relations": [
     {
       "type": "one_to_many",
-      "source": "Ponpure_LeadDetails",
-      "target": "Ponpure_Quotationhdrs",
-      "source_key": "enquiry_id",
-      "target_key": "enquiry_id",
-      "description": "Each lead or enquiry can generate multiple quotations."
+      "source": "MH_AD_AI_DIMENSION",
+      "target": "MH_RO_HDR_DETAILS",
+      "source_key": "delr_cd",
+      "target_key": "LOCTN_CD",
+      "description": "Each dealer location can have multiple repair orders over time."
     },
     {
       "type": "one_to_many",
-      "source": "Ponpure_Quotationhdrs",
-      "target": "Ponpure_SaleorderHdrs",
-      "source_key": "quotation_number",
-      "target_key": "quotation_number",
-      "description": "A quotation can be converted into one or more sales orders (system-supported, though typically one)."
+      "source": "MH_MODEL_MASTER",
+      "target": "MH_RO_HDR_DETAILS",
+      "source_key": "MODL_CD",
+      "target_key": "MODL_CD",
+      "description": "Each vehicle model can appear on multiple repair orders across different vehicles."
     },
     {
       "type": "one_to_many",
-      "source": "Ponpure_SaleorderHdrs",
-      "target": "Ponpure_SaleOrderDtls",
-      "source_key": "header_id",
-      "target_key": "header_id",
-      "description": "A sales order header contains multiple sales order line items."
+      "source": "MH_RO_HDR_DETAILS",
+      "target": "MH_CUST_VERBATIM",
+      "source_key": "sv_ro_hdr_sk",
+      "target_key": "sv_ro_hdr_sk",
+      "description": "Each repair order header can have multiple customer verbatim/comments describing issues or service requests."
     },
     {
       "type": "one_to_many",
-      "source": "Ponpure_SaleOrderDtls",
-      "target": "Ponpure_Schedules",
-      "source_key": "line_id",
-      "target_key": "sale_order_detail_line_id",
-      "description": "Each sales order line item can have multiple delivery schedules."
+      "source": "MH_RO_HDR_DETAILS",
+      "target": "MH_RO_LABOUR",
+      "source_key": "sv_ro_hdr_sk",
+      "target_key": "sv_ro_hdr_sk",
+      "description": "Each repair order header contains multiple labor line items for different services performed."
     },
     {
       "type": "one_to_many",
-      "source": "Ponpure_Schedules",
-      "target": "Ponpure_DispatchDetails",
-      "source_key": "line_id",
-      "target_key": "schedule_line_id",
-      "description": "Each schedule line can have one or more dispatches recorded against it."
+      "source": "MH_RO_HDR_DETAILS",
+      "target": "MH_RO_PARTS",
+      "source_key": "sv_ro_hdr_sk",
+      "target_key": "sv_ro_hdr_sk",
+      "description": "Each repair order header contains multiple parts line items for parts consumed during service."
     }
   ]
 }
