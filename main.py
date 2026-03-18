@@ -1,0 +1,1598 @@
+from fastapi import FastAPI, Form, HTTPException, Query, UploadFile, File,Depends, status
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+from starlette.requests import Request
+from fastapi.staticfiles import StaticFiles
+# from langchain_openai import ChatOpenAI
+import plotly.graph_objects as go, plotly.express as px
+import openai, yaml, os, csv,pandas as pd, base64, uuid, msal, time
+from configure import gauge_config
+# from pydantic import BaseModel
+from io import BytesIO, StringIO
+# from langchain.chains.openai_tools import create_extraction_chain_pydantic
+from pydantic import Field, BaseModel
+from starlette.middleware.sessions import SessionMiddleware
+
+# from langchain_openai import ChatOpenAI
+from newlangchain_utils import *
+from dotenv import load_dotenv
+# from state import session_state, session_lock
+from typing import Optional, List, Dict
+from fastapi.middleware.cors import CORSMiddleware
+from azure.storage.blob import BlobServiceClient
+from starlette.middleware.base import BaseHTTPMiddleware
+import logging
+from logging.config import dictConfig
+import automotive_wordcloud_analysis as awa
+import zipfile
+from wordcloud import WordCloud
+from table_details import get_table_details, get_table_metadata  # Importing the function
+from openai import AzureOpenAI
+# from langchain_openai import AzureChatOpenAI
+from SM_examples import get_examples
+# Configure logging
+from dotenv import load_dotenv
+load_dotenv()
+
+# logging.basicConfig(level=logging.INFO)
+from logger_custom import logger
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
+from dependencies import  get_db
+from contextlib import asynccontextmanager
+import redis
+class LoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Log the request details
+        logging.info(f"Request: {request.method} {request.url}")
+        
+        # Call the next middleware or endpoint
+        response = await call_next(request)
+        
+        # Log the response details
+        logging.info(f"Response status: {response.status_code}")
+        
+        return response
+
+load_dotenv()  # Load environment variables from .env file
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Azure OpenAI LLM
+    # app.state.azure_openai_client = AzureOpenAI(
+    #     azure_deployment=os.environ["AZURE_DEPLOYMENT_NAME"],
+    #     api_key=os.environ["AZURE_OPENAI_API_KEY"],
+    #     api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-01"),
+    #     azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"]
+    # )
+
+    # Azure SQL DB
+    engine = create_engine(
+      
+
+        SQL_DATABASE_URL,
+        pool_size=int(SQL_POOL_SIZE),
+        max_overflow=int(SQL_MAX_OVERFLOW),
+        echo=False,
+        pool_recycle=1200,  # Recycle every 20 minutes
+        pool_pre_ping=True  # Validate connection before using
+    )
+    app.state.engine = engine
+    app.state.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+    # Azure Redis Cache (async)
+    app.state.redis_client = redis.Redis(
+        host=os.environ["REDIS_HOST"],
+        port=int(os.environ.get("REDIS_PORT", 6380)),
+        password=os.environ["REDIS_KEY"],
+        ssl=True,
+        decode_responses=True,
+        max_connections=20
+    )
+    # Azure Redis Cache (async)
+    app.state.redis_client = redis.Redis(
+        host=os.environ["REDIS_HOST"],
+        port=int(os.environ.get("REDIS_PORT", 6380)),
+        password=os.environ["REDIS_KEY"],
+        ssl=True,
+        decode_responses=True,
+        max_connections=20
+    )
+
+    yield
+    await app.state.redis_client.close()
+    await app.state.redis_client.close()
+
+    engine.dispose()
+
+
+app = FastAPI(lifespan=lifespan)
+# app.add_middleware(SessionMiddleware, secret_key=os.getenv("SESSION_SECRET", "your-secret-key-here"))
+
+app.add_middleware(LoggingMiddleware)
+# Set up static files and templates
+templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+AZURE_STORAGE_CONNECTION_STRING = os.getenv('AZURE_STORAGE_CONNECTION_STRING')
+AZURE_CONTAINER_NAME = os.getenv('AZURE_CONTAINER_NAME')
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+AUTHORITY = os.getenv("AUTHORITY")
+REDIRECT_PATH = os.getenv("REDIRECT_PATH")
+SCOPES = ["User.Read"]
+##Redis Utility Functions
+def get_cache_key(*args, **kwargs):
+    """Generate a unique cache key from function arguments"""
+    key_parts = [str(arg) for arg in args]
+    key_parts.extend([f"{k}={v}" for k, v in kwargs.items()])
+    return "::".join(key_parts)
+
+async def cache_response(redis_client, key: str, data: dict, expire: int | None = None):
+    """Cache the response data with expiration"""
+    try:
+        if expire is not None:
+            redis_client.setex(key, expire, json.dumps(data))
+        else:
+            redis_client.set(key, json.dumps(data))
+    except Exception as e:
+        logger.error(f"Error caching data: {str(e)}")
+
+async def get_cached_response(redis_client, key: str):
+    """Retrieve cached response if exists"""
+    try:
+        cached_data = redis_client.get(key)
+        if cached_data:
+            return json.loads(cached_data)
+        return None
+    except Exception as e:
+        logger.error(f"Error retrieving cached data: {str(e)}")
+        return None
+SESSION_COOKIE_NAME = "session_id"
+
+def get_session_id(request: Request) -> str | None:
+    return request.cookies.get(SESSION_COOKIE_NAME)
+
+async def get_session_data(redis_client, session_id: str):
+    return await get_cached_response(redis_client, key=f"session::{session_id}")
+def user_sessions_key(user_oid: str) -> str:
+    return f"user::{user_oid}::sessions"
+
+async def set_session_data(redis_client, session_id: str, data: dict, expire: int |None= None):
+    await cache_response(redis_client, key=f"session::{session_id}", data=data, expire=expire)
+
+async def clear_session_data(redis_client, session_id: str):
+    try:
+        redis_client.delete(f"session::{session_id}")
+    except Exception as e:
+        logger.error(f"Error clearing session data: {str(e)}")
+
+def get_redis_client(request: Request):
+    return request.app.state.redis_client
+
+def get_session_id_dep(request: Request) -> str:
+    return get_session_id(request)
+
+async def get_session_data_dep(
+    redis_client = Depends(get_redis_client),
+    request: Request = None,
+):
+    session_id = get_session_id(request)
+    return await get_cached_response(
+        redis_client, f"session::{session_id}"
+    ) or {}
+
+# Initialize the BlobServiceClient
+try:
+    blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+    logger.info("Blob service client initialized successfully.")
+except Exception as e:
+    logger.error(f"Error initializing BlobServiceClient: {e}")
+    # Handle the error appropriately, possibly exiting the application
+    raise  # Re-raise the exception to prevent the app from starting
+from pydantic import BaseModel
+class ChartRequest(BaseModel):
+    """
+    Pydantic model for chart generation requests.
+    """
+    table_name: str
+    x_axis: str
+    y_axis: str
+    chart_type: str
+
+    class Config:  # This ensures compatibility with FastAPI
+        json_schema_extra = {
+            "example": {
+                "table_name": "example_table",
+                "x_axis": "column1",
+                "y_axis": "column2",
+                "chart_type": "Line Chart"
+            }
+        }
+
+# Initialize OpenAI API key and model
+# OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
+# openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+
+AZURE_OPENAI_API_KEY = os.environ.get('AZURE_OPENAI_API_KEY')
+AZURE_OPENAI_ENDPOINT = os.environ.get('AZURE_OPENAI_ENDPOINT')
+AZURE_OPENAI_API_VERSION = os.environ.get('AZURE_OPENAI_API_VERSION', "2024-02-01")
+AZURE_DEPLOYMENT_NAME = os.environ.get('AZURE_DEPLOYMENT_NAME')
+
+# Initialize the Azure OpenAI client
+azure_openai_client = AzureOpenAI(
+    azure_deployment=AZURE_DEPLOYMENT_NAME,
+
+    api_key=AZURE_OPENAI_API_KEY,
+    api_version=AZURE_OPENAI_API_VERSION,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT
+)
+
+# llm = AzureOpenAI(
+#     api_version=AZURE_OPENAI_API_VERSION,
+#     azure_deployment=AZURE_DEPLOYMENT_NAME,
+#     azure_endpoint=AZURE_OPENAI_ENDPOINT,
+#     api_key=AZURE_OPENAI_API_KEY,
+# )
+
+databases = ["Azure SQL"]
+question_dropdown = os.getenv('Question_dropdown')
+
+from datetime import datetime,date
+
+def convert_dates(obj):
+    if isinstance(obj, dict):
+        return {k: convert_dates(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_dates(item) for item in obj]
+    elif isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    else:
+        return obj
+class Table(BaseModel):
+    """Table in SQL database."""
+    name: str = Field(description="Name of table in SQL database.")
+
+def download_as_excel(data: pd.DataFrame, filename: str = "data.xlsx"):
+    """
+    Converts a Pandas DataFrame to an Excel file and returns it as a stream.
+
+    Args:
+        data (pd.DataFrame): The DataFrame to convert.
+        filename (str): The name of the Excel file.  Defaults to "data.xlsx".
+
+    Returns:
+        BytesIO:  A BytesIO object containing the Excel file.
+    """
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        data.to_excel(writer, index=False, sheet_name='Sheet1')
+    output.seek(0)  # Reset the pointer to the beginning of the stream
+    return output
+@app.get("/login")
+async def login(
+    request: Request,
+    redis_client=Depends(get_redis_client),
+):
+    # 🔥 ALWAYS control session_id explicitly
+    session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    if not session_id:
+        session_id = str(uuid.uuid4())
+
+    msal_app = msal.ConfidentialClientApplication(
+        CLIENT_ID,
+        authority=AUTHORITY,
+        client_credential=CLIENT_SECRET,
+    )
+
+    flow = msal_app.initiate_auth_code_flow(
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_PATH
+    )
+
+    # ✅ store flow safely
+    await cache_response(
+        redis_client,
+        key=f"session::{session_id}",
+        data={"flow": flow},
+        expire=600  # short-lived
+    )
+
+    logger.info(f"[login] stored flow for session {session_id}")
+
+    response = RedirectResponse(url=flow["auth_uri"])
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_id,
+        httponly=True,
+        secure=False,
+        samesite="lax"
+    )
+    return response
+
+@app.get("/getAToken")
+async def get_a_token(
+    request: Request,
+    redis_client=Depends(get_redis_client),
+    session_id: str = Depends(get_session_id_dep),
+):
+    params = dict(request.query_params)
+    logger.info(f"Session ID in getAToken: {session_id}")
+    logger.info(f"Cookies in getAToken: {request.cookies}")
+
+    # Handle Azure AD error
+    if "error" in params:
+        return HTMLResponse(
+            content=f"Error: {params.get('error_description', 'Unknown error')}",
+            status_code=400,
+        )
+
+    # 🔑 Read existing session
+    session_data = await get_cached_response(
+        redis_client, f"session::{session_id}"
+    ) or {}
+    session_data['current_question_type'] = 'generic'
+    # OAuth flow must exist
+    if "flow" not in session_data:
+        logger.warning("OAuth flow missing in session. Redirecting to /login")
+        return RedirectResponse("/login")
+
+    # Exchange auth code for token
+    result = msal.ConfidentialClientApplication(
+        CLIENT_ID,
+        authority=AUTHORITY,
+        client_credential=CLIENT_SECRET,
+    ).acquire_token_by_auth_code_flow(session_data["flow"], params)
+
+    if "id_token_claims" not in result:
+        logger.error("ID token claims missing in MSAL response")
+        return HTMLResponse(
+            content="Could not retrieve user information.",
+            status_code=400,
+        )
+
+    # ✅ Authenticated user
+    user_claims = result["id_token_claims"]
+    user_oid = user_claims["oid"]
+
+    logger.info(f"User authenticated successfully. oid={user_oid}")
+
+    # 🔒 USER cache (source of truth)
+    await cache_response(
+        redis_client,
+        key=f"user::{user_oid}",
+        data={
+            "user": user_claims,
+            "current_question_type": "generic",
+            "created_at": int(time.time())
+        }
+    )
+
+    # 🔗 Register session under user
+    redis_client.sadd(
+        user_sessions_key(user_oid),
+        session_id
+    )
+
+    # 🧠 Update session (DO NOT recreate)
+    session_data["user_oid"] = user_oid
+    session_data.setdefault("messages", [])
+    session_data.setdefault("created_at", int(time.time()))
+
+    await set_session_data(redis_client, session_id, session_data)
+
+    # 🍪 Redirect to app
+    response = RedirectResponse("/")
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_id,
+        httponly=True,
+        secure=False,  # True in prod
+        samesite="lax",
+    )
+    return response
+@app.get("/get_prompt")
+async def get_prompt(type: str):
+    if type == "interpretation":
+        filename = "chatbot_prompt.yaml"
+    elif type == "langchain":
+        filename = "final_prompt.txt"
+    else:
+        return "Invalid prompt type", 400
+    try:
+        with open(filename, "r",encoding='utf-8') as f:
+            prompt = f.read()
+        return prompt
+    except FileNotFoundError:
+        return "Prompt file not found", 404
+def create_gauge_chart_json(title, value, min_val=0, max_val=100, color="blue", subtext="%"):
+    """
+    Creates a gauge chart using Plotly and returns it as a JSON string.
+
+    Args:
+        title (str): The title of the chart.
+        value (float): The value to display on the gauge.
+        min_val (int): The minimum value of the gauge.  Defaults to 0.
+        max_val (int): The maximum value of the gauge.  Defaults to 100.
+        color (str): The color of the gauge.  Defaults to "blue".
+        subtext (str): The subtext to display below the value. Defaults to "%".
+
+    Returns:
+        str: A JSON string representation of the gauge chart.
+    """
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=value,
+        title={'text': title, 'font': {'size': 18, 'color': 'black'}},
+        gauge={
+            'axis': {'range': [min_val, max_val], 'tickwidth': 1, 'tickcolor': "darkblue"},
+            'bar': {'color': color, 'thickness': 1},
+            'bgcolor': "white",
+            'borderwidth': 0.7,
+            'bordercolor': "black",
+
+            'threshold': {
+                'line': {'color': color, 'width': 4},
+                'thickness': 0.75,
+                'value': value
+            }
+        },
+        number={'suffix': subtext, 'font': {'size': 16, 'color': 'gray'}}
+    ))
+
+    # Adjust the layout to prevent cropping
+    fig.update_layout(
+        width=350,  # Increased width
+        height=350,  # Increased height
+        margin=dict(
+            t=50,  # Top margin
+            b=50,  # Bottom margin
+            l=50,  # Left margin
+            r=50   # Right margin
+        )
+
+    )
+    return fig.to_json()  # Return JSON instead of an image
+
+class QueryInput(BaseModel):
+    """
+    Pydantic model for user query input.
+    """
+    query: str
+
+@app.post("/add_to_faqs")
+async def add_to_faqs(data: QueryInput, subject:str, request:Request, 
+                    
+                    session_data: dict = Depends(get_session_data_dep),
+
+                    ):
+    """
+    Adds a user query to the FAQ CSV file on Azure Blob Storage.
+
+    Args:
+        data (QueryInput): The user query.
+
+    Returns:
+        JSONResponse: A JSON response indicating success or failure.
+    """
+    print(f"subject: {subject}")
+    query = data.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Invalid query!")
+    question_type = session_data['current_question_type']
+
+    if question_type == 'generic':
+        blob_name = f'table_files/{subject}_questions_generic.csv'
+    elif question_type == "usecase":
+        blob_name = f'table_files/{subject}_questions.csv'
+    try:
+        # Get the blob client
+        blob_client = blob_service_client.get_blob_client(container=AZURE_CONTAINER_NAME, blob=blob_name)
+
+        try:
+            # Download the blob content
+            blob_content = blob_client.download_blob().content_as_text()
+        except ResourceNotFoundError:
+            # If the blob doesn't exist, create a new one with a header if needed
+            blob_content = "question\n"  # Replace with your actual header
+
+        # Append the new query to the existing CSV content
+        updated_csv_content = blob_content + f"{query}\n"  # Append new query
+
+        # Upload the updated CSV content back to Azure Blob Storage
+        blob_client.upload_blob(updated_csv_content.encode('utf-8'), overwrite=True)
+
+        return {"message": "Query added to FAQs successfully and uploaded to Azure Blob Storage!"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+def generate_chart_figure(data_df: pd.DataFrame, x_axis: str, y_axis: str, chart_type: str):
+    """
+    Generates a Plotly figure based on the specified chart type.
+    Includes support for Word Cloud visualization.
+
+    Args:
+        data_df (pd.DataFrame): The DataFrame containing the data.
+        x_axis (str): The column name for the x-axis.
+        y_axis (str): The column name for the y-axis.
+        chart_type (str): The type of chart to generate.
+
+    Returns:
+        plotly.graph_objects.Figure: A Plotly figure, or None if the chart type is unsupported.
+    """
+    fig = None
+    try:
+        if chart_type == "Line Chart":
+            fig = px.line(data_df, x=x_axis, y=y_axis)
+        elif chart_type == "Bar Chart":
+            fig = px.bar(data_df, x=x_axis, y=y_axis)
+        elif chart_type == "Scatter Plot":
+            fig = px.scatter(data_df, x=x_axis, y=y_axis)
+        elif chart_type == "Pie Chart":
+            fig = px.pie(data_df, names=x_axis, values=y_axis)
+        elif chart_type == "Histogram":
+            fig = px.histogram(data_df, x=x_axis, y=y_axis)
+        elif chart_type == "Box Plot":
+            fig = px.box(data_df, x=x_axis, y=y_axis)
+        elif chart_type == "Heatmap":
+            fig = px.density_heatmap(data_df, x=x_axis, y=y_axis)
+        elif chart_type == "Violin Plot":
+            fig = px.violin(data_df, x=x_axis, y=y_axis)
+        elif chart_type == "Area Chart":
+            fig = px.area(data_df, x=x_axis, y=y_axis)
+        elif chart_type == "Funnel Chart":
+            fig = px.funnel(data_df, x=x_axis, y=y_axis)
+        elif chart_type == "Word Cloud":
+            # For Word Cloud, we only need text data from x_axis column
+            text_data = data_df[x_axis].dropna().astype(str).tolist()
+            text = ' '.join(text_data)
+            
+            # Generate word cloud
+            wordcloud = WordCloud(width=800, height=400, 
+                                background_color='white',
+                                max_words=200).generate(text)
+            
+            # Convert to Plotly figure
+            fig = px.imshow(wordcloud.to_array())
+            fig.update_layout(
+                
+                xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+                yaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+                margin=dict(l=20, r=20, t=40, b=20)
+            )
+            
+        return fig
+    except Exception as e:
+        logger.info(f"Error generating {chart_type} chart: {str(e)}")
+        raise
+
+class ChartRequest(BaseModel):
+    x_axis: str
+    y_axis: str
+    chart_type: str
+    table_data: List[Dict]  # List of row dicts
+
+
+@app.post("/generate-chart")
+async def generate_chart(request0: ChartRequest):
+    """
+    Generates a chart based on the provided request data.
+    Handles both numeric charts and text-based Word Cloud.
+    """
+    try:
+        x_axis = request0.x_axis
+        y_axis = request0.y_axis
+        chart_type = request0.chart_type
+        table_data = request0.table_data  # List of dicts
+
+        # Convert list of dicts to DataFrame
+        data_df = pd.DataFrame(table_data)
+
+        # Validate columns exist
+        if x_axis not in data_df.columns:
+            raise HTTPException(status_code=400, detail=f"Column '{x_axis}' not found in data")
+        if chart_type != "Word Cloud" and y_axis not in data_df.columns:
+            raise HTTPException(status_code=400, detail=f"Column '{y_axis}' not found in data")
+
+        # Data processing based on chart type
+        if chart_type == "Word Cloud":
+            if not pd.api.types.is_string_dtype(data_df[x_axis]):
+                data_df[x_axis] = data_df[x_axis].astype(str)
+        else:
+            try:
+                data_df[y_axis] = pd.to_numeric(data_df[y_axis], errors='coerce')
+                data_df = data_df.dropna(subset=[y_axis])
+                if len(data_df) == 0:
+                    raise ValueError("No valid numeric data available after conversion")
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Error processing numeric data: {str(e)}")
+
+        # Generate the chart
+        fig = generate_chart_figure(data_df, x_axis, y_axis, chart_type)
+        if fig is None:
+            raise HTTPException(status_code=400, detail="Unsupported chart type selected")
+
+        return JSONResponse(content={"chart": fig.to_json()})
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+class TableDownloadRequest(BaseModel):
+    table_name: str
+    table_data: dict
+
+@app.get("/download-table/")
+@app.post("/download-table")
+async def download_table(payload: TableDownloadRequest):
+    """
+    Downloads a table as an Excel file from sent JSON data.
+    """
+    table_name = payload.table_name
+    data_dict = payload.table_data
+    # Extract the list of rows from the dict
+    rows = data_dict.get('Table data', [])
+    # Convert to DataFrame
+    df = pd.DataFrame(rows)
+
+    logger.info("data for download: ", df)
+    # Generate Excel file (implement this function as you need)
+    output = download_as_excel(df, filename=f"{table_name}.xlsx")
+
+    # Return as streaming response
+    response = StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    response.headers["Content-Disposition"] = f"attachment; filename={table_name}.xlsx"
+    return response
+# Replace APIRouter with direct app.post
+def format_number(x):
+    if isinstance(x, int):  # Check if x is an integer
+        return f"{x:d}"
+    elif isinstance(x, float) and x.is_integer():  # Check if x is a float and is equivalent to an integer
+        return f"{int(x):d}"
+    else:
+        return f"{x:.1f}"  # For other floats, format with one decimal place
+@app.post("/transcribe-audio/")
+async def transcribe_audio(file: UploadFile = File(...)):
+    """
+    Transcribes an audio file using Azure OpenAI's Whisper model.
+
+    Args:
+        file (UploadFile): The audio file to transcribe.
+
+    Returns:
+        JSONResponse: A JSON response containing the transcription or an error message.
+    """
+    try:
+        # Check if API key is available
+        if not AZURE_OPENAI_API_KEY:
+            raise HTTPException(status_code=500, detail="Missing Azure OpenAI API Key.")
+        
+        # Read audio file
+        audio_bytes = await file.read()
+        audio_bio = BytesIO(audio_bytes)
+        audio_bio.name = file.filename  # Use original filename or set appropriate extension
+
+        # Transcribe using Azure OpenAI
+        transcript = azure_openai_client.audio.transcriptions.create(
+            model="whisper-1",  # Azure deployment name for Whisper model
+            file=audio_bio
+        )
+
+        return {"transcription": transcript.text}
+
+    except Exception as e:
+        return JSONResponse(
+            content={"error": f"Error transcribing audio: {str(e)}"}, 
+            status_code=500
+        )
+
+@app.get("/get_questions/")
+@app.get("/get_questions")
+async def get_questions(subject: str, request: Request,
+            session_data: dict = Depends(get_session_data_dep),
+            ):
+    """
+    Fetches questions from a CSV file in Azure Blob Storage based on the selected subject.
+
+    Args:
+        subject (str): The subject to fetch questions for.
+
+    Returns:
+        JSONResponse: A JSON response containing the list of questions or an error message.
+    """
+
+    question_type = session_data.get("current_question_type", "generic")
+    logger.info(f"que type: {question_type}")
+    if question_type == 'generic':
+        csv_file_name = f"table_files/{subject}_questions_generic.csv"
+    else: 
+        csv_file_name = f"table_files/{subject}_questions.csv"
+    blob_client = blob_service_client.get_blob_client(container=AZURE_CONTAINER_NAME, blob=csv_file_name)
+
+    try:
+        # Check if the blob exists
+        if not blob_client.exists():
+            logger.error(f"file not found {csv_file_name}")
+            return JSONResponse(
+                content={"error": f"The file {csv_file_name} does not exist."}, status_code=404
+            )
+
+        # Download the blob content
+        blob_content = blob_client.download_blob().content_as_text()
+
+        # Read the CSV content
+        questions_df = pd.read_csv(StringIO(blob_content))
+        
+        if "question" in questions_df.columns:
+            questions = questions_df["question"].tolist()
+        else:
+            questions = questions_df.iloc[:, 0].tolist()
+
+        return {"questions": questions}
+
+    except Exception as e:
+        return JSONResponse(
+            content={"error": f"An error occurred while reading the file: {str(e)}"}, status_code=500
+        )
+# Function to load prompts from YAML
+
+def load_prompts(filename:str):
+    """
+    Loads prompts from the chatbot_prompt.yaml file.
+
+    Returns:
+        dict: A dictionary containing the loaded prompts.
+    """
+    try:
+        with open(filename, "r", encoding="utf-8") as file:
+            return yaml.safe_load(file)
+    except Exception as e:
+        logger.info(f"Error reading prompts file: {e}")
+        return {}
+    
+
+# @app.post("/submit_feedback/")
+# @app.post("/submit_feedback")
+# async def submit_feedback(request: Request):
+#     data = await request.json() # Corrected for FastAPI
+    
+#     table_name = data.get("table_name")
+#     feedback_type = data.get("feedback_type")
+#     user_query = data.get("user_query")
+#     sql_query = data.get("sql_query")
+
+#     if not table_name or not feedback_type:
+#         return JSONResponse(content={"success": False, "message": "Table name and feedback type are required."}, status_code=400)
+
+#     try:
+#         # Create database connection
+#         engine = create_engine(
+#         f'postgresql+psycopg2://{quote_plus(db_user)}:{quote_plus(db_password)}@{db_host}:{db_port}/{db_database}'
+#         )
+#         Session = sessionmaker(bind=engine)
+#         session = Session()
+
+#         # Sanitize input (Escape single quotes)
+#         table_name = escape_single_quotes(table_name)
+#         user_query = escape_single_quotes(user_query)
+#         sql_query = escape_single_quotes(sql_query)
+#         feedback_type = escape_single_quotes(feedback_type)
+
+#         # Insert feedback into database
+#         insert_query = f"""
+#         INSERT INTO lz_feedbacks (department, user_query, sql_query, table_name, data, feedback_type, feedback)
+#         VALUES ('unknown', :user_query, :sql_query, :table_name, 'no data', :feedback_type, 'user feedback')
+#         """
+
+#         session.execute(insert_query, {
+#         "table_name": table_name,
+#         "user_query": user_query,
+#         "sql_query": sql_query,
+#         "feedback_type": feedback_type
+#         })
+
+#         session.commit()
+#         session.close()
+
+#         return JSONResponse(content={"success": True, "message": "Feedback submitted successfully!"})
+
+#     except Exception as e:
+#         session.rollback()
+#         session.close()
+#         return JSONResponse(content={"success": False, "message": f"Error submitting feedback: {str(e)}"}, status_code=500)
+
+
+import csv
+
+def get_keyphrases():
+    keyphrases = []
+    with open('table_files/keyphrases_rephrasing.csv', newline='', encoding='utf-8') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            # Assumes the column is named exactly 'keyphrases'
+            if 'keyphrases' in row and row['keyphrases']:
+                keyphrases.append(row['keyphrases'])
+    return ','.join(keyphrases)
+
+# if 'messages' not in session_state:
+#     session_state['messages'] = []
+    
+def parse_table_data(csv_file_path):
+    """
+    Parses a CSV file containing table definitions and returns structured data.
+    
+    Args:
+        csv_file_path (str): Path to the CSV file
+        
+    Returns:
+        dict: A dictionary with table names as keys and their metadata as values
+              Format: {
+                  'table_name': {
+                      'description': 'table description',
+                      'columns': [
+                          {
+                              'name': 'column_name',
+                              'type': 'data_type',
+                              'nullable': boolean,
+                              'description': 'column description'
+                          },
+                          ...
+                      ]
+                  },
+                  ...
+              }
+    """
+    tables = defaultdict(lambda: {
+        'description': '',
+        'columns': []
+    })
+    
+    with open(csv_file_path, mode='r', encoding='utf-8') as file:
+        reader = csv.reader(file)
+        
+        for row in reader:
+            if len(row) < 3:  # Skip incomplete rows
+                continue
+                
+            table_name = row[0].strip()
+            table_description = row[1].strip()
+            column_info = row[2].strip()
+            
+            # Parse column information (name, type, nullable, description)
+            if '(' in column_info:
+                # Extract column name and type
+                col_name = column_info.split('(')[0].strip()
+                type_part = column_info.split('(')[1].split(')')[0].strip()
+                
+                # Check for NULLABLE
+                nullable = 'NULLABLE' in column_info
+                
+                # Extract description (after colon if present)
+                if ':' in column_info:
+                    col_desc = column_info.split(':')[-1].strip()
+                else:
+                    col_desc = ''
+            else:
+                col_name = column_info
+                type_part = ''
+                nullable = False
+                col_desc = ''
+            
+            # Ensure table exists in dictionary
+            if table_name not in tables:
+                tables[table_name]['description'] = table_description
+            
+            # Add column information
+            tables[table_name]['columns'].append({
+                'name': col_name,
+                'type': type_part,
+                'nullable': nullable,
+                'description': col_desc
+            })
+    
+    return dict(tables)
+
+
+@app.post("/submit")
+async def submit_query(
+    request: Request,
+    section: str = Form(...),
+    database: str = Form(...), 
+    user_query: str = Form(...),
+    page: int = Query(1),
+    records_per_page: int = Query(10),
+    model: Optional[str] = Form(AZURE_DEPLOYMENT_NAME),
+    db: Session = Depends(get_db),
+    session_data: dict = Depends(get_session_data_dep),
+    redis_client=Depends(get_redis_client),
+    session_id: str = Depends(get_session_id_dep)
+    
+):
+
+    # cache_key = get_cache_key(
+    #     "submit_query",
+    #     user_query=user_query,
+    #     section=section,
+    #     database=database,
+    #     question_type=request.session.get("current_question_type", "generic")
+    # )
+    
+    # # Check cache first
+    # redis_client = request.app.state.redis_client
+    # cached_response = await get_cached_response(redis_client, cache_key)
+    # if cached_response:
+    #     logger.info(f"Cache HIT for key: {cache_key}")
+    #     logger.info("Returning cached response")
+    #     return JSONResponse(content=cached_response)
+    # else:
+    #     logger.info(f"Cache MISS for key: {cache_key}")
+    user_oid = await resolve_user_oid(redis_client, session_id, session_data)
+
+    if not user_oid:
+        raise HTTPException(status_code=401, detail="User not authenticated")
+
+
+    # cache_key = f"user::{user_oid}::submit_query::{hash(user_query + section + database)}"
+ 
+    messages = session_data.get("messages", [])
+
+    # Check cache first
+    redis_client = request.app.state.redis_client
+    # cached_response = await get_cached_response(redis_client, cache_key)
+    # if cached_response:
+    #     logger.info(f"Cache HIT for key: {cache_key}")
+
+    #     cached_response["history"] = messages
+    #     logger.info("Returning cached response")
+    #     return JSONResponse(content=cached_response)
+    # else:
+    #     logger.info(f"Cache MISS for key: {cache_key}")
+    # logger.info(f"Received /submit request with query: {user_query}, section: {section}, database: {database}")
+    
+    # Initialize response structure
+    response_data = {
+        "user_query": user_query,
+        "query": "",
+        "tables": [],
+        "llm_response": "",
+        "chat_response": "",
+        "history":  session_data.get('messages', []),
+        "interprompt": "",
+        "langprompt": "",
+        "suggested_questions": [],
+        "error": None
+    }
+
+    try:
+        # Reset per-request variables
+        unified_prompt = ""
+        final_prompt = ""
+        llm_reframed_query = ""
+
+        # Get current question type from session
+        current_question_type = session_data.get("current_question_type", "generic")
+        # prompts = request.session.get("prompts", load_prompts("generic_prompt.yaml")
+        prompts = load_prompts("generic_prompt.yaml")
+        # session_data['user_query'] = user_query  # Still store original query separately if needed
+
+        # Handle session messages
+        if "messages" not in session_data:
+            session_data["messages"] = []
+        
+        # Don't add user_query to messages yet - we'll add the reframed version later
+        chat_history = ""
+        if session_data['messages']:  # Check if messages exist (should contain at most 1)
+            last_msg = session_data['messages'][-1]  # Get the only message
+            chat_history = f"{last_msg['role']}: {last_msg['content']}"
+        
+        logger.info(f"Chat history: {chat_history}")
+        # logger.info(f"Messages in session for new question: {request.session['messages']}")
+        # Step 1: Generate unified prompt based on question type
+        try:
+            logger.info(f"Inside /submit request and user has chosen  {current_question_type}.")
+
+            if current_question_type == "usecase":
+                key_parameters = get_key_parameters()
+                keyphrases = get_keyphrases()
+                unified_prompt = prompts["unified_prompt"].format(
+                    user_query=user_query,
+                    chat_history=chat_history,
+                    key_parameters=key_parameters,
+                    keyphrases=keyphrases
+                )
+                
+                # llm_reframed_query = llm.invoke(unified_prompt).content.strip()
+                response = azure_openai_client.chat.completions.create(
+                    model=AZURE_DEPLOYMENT_NAME,
+                    messages=[
+                    {"role": "system", "content": unified_prompt},
+                    {"role": "user", "content": user_query}
+                ],
+                temperature=0,  # Lower temperature for more predictable, structured output
+                response_format={"type": "json_object"}  # This is the key parameter!
+                )
+            # The response content will be a JSON string
+                response_content = response.choices[0].message.content
+                logger.info(f"Inside submit function: response recieved is: {response_content}")
+               
+                # Parse the guaranteed JSON string into a Python dictionary
+                json_output = json.loads(response_content)
+                logger.info(f"json output in usecase: {json_output}")
+                # Now you can safely access the keys
+                llm_reframed_query = json_output.get("rephrased_query")
+                logger.info(f"reframed query after modification: {llm_reframed_query}")
+
+                intent_result = intent_classification(llm_reframed_query)
+                
+                if not intent_result:
+                    error_msg = "Please rephrase or add more details to your question as I am not able to assess the Intended Use case"
+                    
+                    
+                    response_data = {
+                        "user_query": user_query,
+                        "query": "",
+                        "tables": "",
+                        "llm_response": llm_reframed_query,
+                        "chat_response": error_msg,
+                        "history": session_data['messages'],
+                        "interprompt": unified_prompt,
+                        "langprompt": "",
+                        "suggested_questions": [],
+                        
+                    }
+                    return JSONResponse(content=response_data)
+                chosen_tables = intent_result["tables"]
+                selected_business_rule = get_business_rule(intent_result["intent"])
+                
+            elif current_question_type == "generic":
+                tables_metadata = get_table_metadata()
+                unified_prompt = prompts["unified_prompt"].format(
+                    user_query=user_query,
+                    chat_history=chat_history,
+                    key_parameters=get_key_parameters(),
+                    keyphrases=get_keyphrases(),
+                    table_metadata=tables_metadata
+                )
+                
+                # llm_response_str = llm.invoke(unified_prompt).content.strip()
+                response = azure_openai_client.chat.completions.create(
+                    model=AZURE_DEPLOYMENT_NAME,
+                    messages=[
+                    {"role": "system", "content": unified_prompt},
+                    {"role": "user", "content": user_query}
+                ],
+                temperature=0,  # Lower temperature for more predictable, structured output
+                response_format={"type": "json_object"}  # This is the key parameter!
+                )
+
+            # The response content will be a JSON string
+                response_content = response.choices[0].message.content
+                logger.info(f"Inside submit function, generic: response recieved is: {response_content}")
+                
+                # Parse the guaranteed JSON string into a Python dictionary
+                json_output = json.loads(response_content)
+                print("The output of the json is ", json_output)
+
+                # Now you can safely access the keys
+               
+                try:
+                    # llm_result = json.loads(llm_response_str)
+                    llm_reframed_query = json_output.get("rephrased_query", "")
+                    chosen_tables = db_tables
+                    selected_business_rule = ""
+                except json.JSONDecodeError:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Failed to parse LLM response"
+                    )
+            
+            # # Now add the reframed query to messages instead of original user_query
+            # logger.info(f"Now, adding message to history: {llm_reframed_query}")
+            # request.session['messages'] = [{"role": "user", "content": llm_reframed_query}]
+            # logger.info(f"messages in session: {request.session['messages']}")
+            response_data["llm_response"] = llm_reframed_query
+            response_data["interprompt"] = unified_prompt
+            
+        except Exception as e:
+            logger.error(f"Prompt generation error: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Prompt generation failed: {str(e)}"
+            )
+
+        # Rest of your code remains the same...
+        # Step 2: Invoke LangChain
+        try:
+            relationships = find_relationships_for_tables(["Ponpure_LeadDetails","Ponpure_Schedules","Ponpure_Quotationhdrs","Ponpure_SaleOrderdtls","Ponpure_SaleorderHdrs","Ponpure_DispatchDetails"] , 'table_relation.json')
+            table_details = get_table_details(table_name=chosen_tables)
+            examples = get_examples(llm_reframed_query, current_question_type)
+            logger.info(f"relationships: {relationships}")
+            logger.info(f"messages in session just before invoke chain: {session_data['messages']}")
+
+            response, chosen_tables, tables_data, final_prompt = invoke_chain(
+                llm_reframed_query,  # Using the reframed query here
+                session_data['messages'],
+                model,
+                section,
+                database,
+                table_details,
+                selected_business_rule,
+                current_question_type,
+                relationships,
+                examples
+            )
+
+            response_data["langprompt"] = str(final_prompt)  
+                                              
+            response_data["suggested_questions"]=response.get("Suggested_question","")
+            
+            print("Suggested_questions",response_data["suggested_questions"])           
+            
+            if isinstance(response, str):
+                # session_data['generated_query'] = response
+                response_data["query"] = response
+                # session_data['generated_query'] = response
+            else:
+                response_data["query"] = response.get("query", "")
+                print("Query:",response_data["query"])
+                # session_data['generated_query'] = response.get("query", "")
+                # session_data['chosen_tables'] = chosen_tables
+                # request.session['tables_data'] = tables_data
+
+
+        except Exception as e:
+            logger.error(f"LangChain invocation error: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Query execution failed: {str(e)}"
+            )
+
+        # Step 3: Process results
+        try:
+            # Format numeric columns
+            for table_name, df in tables_data.items():
+                for col in df.select_dtypes(include=['number']).columns:
+                    tables_data["Table data"][col] = df[col].apply(format_number)
+            
+            tables_data_dict = {k: v.to_dict(orient='records') for k, v in tables_data.items()}
+
+            # Prepare table HTML
+            initial_page_html = prepare_table_html(tables_data, 1,10)
+
+            response_data["tables"] = initial_page_html
+            response_data["tables_data"] = tables_data_dict           
+         # Generate insights if data exists
+            # data_preview = next(iter(session_state['tables_data'].values())).head(5).to_string(index=False)
+            # response_data["chat_response"] = ""  # Placeholder for actual insights
+            
+        except Exception as e:
+            logger.error(f"Data processing error: {str(e)}")
+            response_data["chat_response"] = f"Data retrieved but processing failed: {str(e)}"
+
+        # Append successful response to chat history
+        # session_state['messages'].append({
+        #     "role": "assistant",
+        #     "content": response_data["chat_response"]
+        # })
+                
+        response_data = convert_dates(response_data)  # Your existing conversion
+        # await cache_response(redis_client, cache_key, response_data)
+        messages.append({
+            "role": "user",
+            "content": llm_reframed_query,
+            "user_query": user_query,
+            "reframed_query": llm_reframed_query,
+            "sql_query": response_data.get("query", "")
+        })
+
+        session_data["messages"] = messages
+
+        await cache_response(
+            redis_client,
+            key=f"session::{session_id}",
+            data=session_data,
+        )
+
+        response_data["history"] = messages
+        # return JSONResponse(content=response_data)
+        response_data = convert_dates(response_data)  # Your existing conversion
+        ENABLE_QUERY_CACHE = False
+
+        if ENABLE_QUERY_CACHE:
+            cache_key ={}
+            await cache_response(redis_client, cache_key, response_data)
+        
+        return JSONResponse(content=response_data)
+
+    except HTTPException as he:
+        # Capture error details
+        response_data.update({
+            "chat_response": f"Error: {he.detail}",
+            "error": str(he.detail),
+            "history": session_data['messages'],
+            "langprompt": str(final_prompt) if 'final_prompt' in locals() else "Not generated due to error",
+            "interprompt": unified_prompt if 'unified_prompt' in locals() else "Not generated due to error"
+        })
+        
+        
+        return JSONResponse(
+            content=response_data,
+            status_code=he.status_code
+        )
+        
+    except Exception as e:
+        # Unexpected errors
+        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+        response_data.update({
+            "chat_response": "An unexpected error occurred",
+            "error": str(e),
+            "history":  session_data['messages'],
+            "langprompt": str(final_prompt) if 'final_prompt' in locals() else "Not generated due to error",
+            "interprompt": unified_prompt if 'unified_prompt' in locals() else "Not generated due to error"
+        })
+        
+        # request.session['messages'].append({
+        #     "role": "user",
+        #     "content": "An unexpected error occurred"
+        # })
+        
+        return JSONResponse(
+            content=response_data,
+            status_code=500
+        )
+
+# Replace APIRouter with direct app.post
+@app.get("/sessions")
+async def list_sessions(
+    redis_client=Depends(get_redis_client),
+    session_id: str = Depends(get_session_id_dep),
+):
+    cookie_session = await get_cached_response(
+        redis_client, f"session::{session_id}"
+    ) or {}
+
+    user_oid = cookie_session.get("user_oid")
+    if not user_oid:
+        raise HTTPException(status_code=401)
+
+    session_ids = redis_client.smembers(f"user::{user_oid}::sessions")
+
+    sessions = []
+    for sid in session_ids:
+        data = await get_cached_response(redis_client, f"session::{sid}")
+        if not data:
+            continue
+
+        created_at = data.get("created_at", 0)
+        messages = data.get("messages", [])
+
+        title = "New chat"
+        if messages:
+            first_user_msg = next(
+                (m["content"] for m in messages if m["role"] == "user"),
+                None
+            )
+            if first_user_msg:
+                title = " ".join(first_user_msg.split()[:4])
+
+        sessions.append({
+            "session_id": sid,
+            "created_at": data.get("created_at"),
+            "count": len(messages),
+            "title": title
+        })
+
+    # 🔽 Oldest → Newest (so numbering is stable)
+    sessions.sort(key=lambda x: x["created_at"] or 0)
+
+    # 🏷️ Assign session numbers + labels
+    for idx, s in enumerate(sessions, start=1):
+        date_str = datetime.fromtimestamp(
+            s["created_at"]
+        ).strftime("%d %b %Y")
+
+        s["session_number"] = idx
+        s["label"] = f"{date_str} : Session {idx}"
+
+    return sessions
+@app.get("/sessions/{session_id}")
+async def load_session(
+    session_id: str,
+    redis_client=Depends(get_redis_client),
+):
+    session = await get_cached_response(
+        redis_client, f"session::{session_id}"
+    )
+
+    if not session:
+        raise HTTPException(status_code=404)
+
+    return {
+        "session_id": session_id,
+        "messages": session.get("messages", [])
+    }
+
+@app.post("/new-session")
+async def reset_session(
+    request: Request,
+    redis_client=Depends(get_redis_client),
+):
+    old_session_id = request.cookies.get(SESSION_COOKIE_NAME)
+
+    # Read old session (optional)
+    old_session = (
+        await get_cached_response(redis_client, f"session::{old_session_id}")
+        if old_session_id else {}
+    )
+
+    user_oid = old_session.get("user_oid")
+
+    if not user_oid:
+        return JSONResponse({"message": "No authenticated user"})
+
+    # 1️⃣ Create NEW session
+    new_session_id = str(uuid.uuid4())
+
+    await cache_response(
+        redis_client,
+        key=f"session::{new_session_id}",
+        data={
+            "user_oid": user_oid,
+            "messages": [],
+            "created_at": int(time.time()),
+            "current_question_type": "generic"
+        }
+    )
+
+    # 2️⃣ Register session under user
+    redis_client.sadd(
+        f"user::{user_oid}::sessions",
+        new_session_id
+    )
+
+    # 3️⃣ Switch cookie to new session
+    response = JSONResponse({"message": "New session started"})
+
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=new_session_id,
+        httponly=True,
+        samesite="lax",
+    )
+
+    return response
+
+def prepare_table_html(tables_data, page_number, records_per_page):
+    """
+    Prepares HTML for displaying table data with pagination (client-side version).
+    Returns the first page by default.
+    """
+    tables_html = []
+    for table_name, data in tables_data.items():
+        total_records = len(data)
+        total_pages = (total_records + records_per_page - 1) // records_per_page
+        
+        # Get the first page by default
+        start_index = (page_number - 1) * records_per_page
+        end_index = start_index + records_per_page
+        page_data = data.iloc[start_index:end_index]
+        
+        # Generate styled HTML
+        styled_html = display_table_with_styles(page_data, table_name)
+        
+        tables_html.append({
+            "table_name": table_name,
+            "table_html": styled_html,
+            "pagination": {
+                "current_page": page_number,
+                "total_pages": total_pages,
+                "records_per_page": records_per_page,
+                "total_records": total_records
+            }
+        })
+    return tables_html
+@app.get("/", response_class=HTMLResponse)
+async def read_root(
+    request: Request,
+    redis_client=Depends(get_redis_client),
+    session_id: str = Depends(get_session_id_dep)
+):
+    # Get fresh session data
+    cookie_session = await get_session_data(redis_client, session_id) or {}
+    user_oid = cookie_session.get("user_oid")
+
+    if not user_oid:
+        return RedirectResponse("/login")
+
+    user_session = await get_cached_response(redis_client, f"user::{user_oid}")
+
+    if not user_session or not user_session.get("user"):
+        return RedirectResponse("/login")
+
+    user_data = user_session["user"]
+    roles = user_data.get('roles', ['guest'])
+    
+    response = templates.TemplateResponse("index.html", {
+        "request": request,
+        "user_role": roles[0],
+        "user_email": user_data.get('preferred_username', ''),
+        "databases": databases,
+        "tables": [],
+        "question_dropdown": question_dropdown.split(',')
+    })
+
+ 
+    
+    return response
+# Table data display endpoint
+@app.get("/session-debug", response_class=JSONResponse)
+async def session_debug(request: Request, 
+            session_data: dict = Depends(get_session_data_dep),
+            
+            session_id: str = Depends(get_session_id_dep)
+            ):
+    return {"session_id": session_id, "data": session_data}
+@app.get("/debug/cache")
+async def debug_cache(
+    redis_client=Depends(get_redis_client),
+    session_id: str = Depends(get_session_id_dep)
+):
+    # Session pointer
+    session_key = f"session::{session_id}"
+    session_data = await get_cached_response(redis_client, session_key)
+
+    user_oid = session_data.get("user_oid") if session_data else None
+
+    user_data = None
+    # query_caches = {}
+
+    if user_oid:
+        user_key = f"user::{user_oid}"
+        user_data = await get_cached_response(redis_client, user_key)
+
+        # ⚠️ Redis KEYS is OK for debugging only
+        # query_keys = redis_client.keys(f"user::{user_oid}::submit_query::*")
+
+        # for k in query_keys:
+        #     query_caches[k] = await get_cached_response(redis_client, k)
+
+    return {
+        "session_key": session_key,
+        "session_data": session_data,
+        "user_key": f"user::{user_oid}" if user_oid else None,
+        "user_data": user_data,
+    }
+
+def display_table_with_styles(data, table_name):
+    """
+    Displays a Pandas DataFrame as an HTML table with custom styles.
+    """
+    # Ensure that the index starts from 1
+    data.index = range(1, len(data) + 1)
+    
+    styled_table = (
+        data.style
+        .set_table_attributes('class="data-table" style="border: 2px solid black; border-collapse: collapse;"')
+        .set_table_styles([
+            {'selector': 'th', 'props': [
+                ('background-color', '#333'), 
+                ('color', 'white'),
+                ('font-weight', 'bold'),
+                ('font-size', '16px')
+            ]},
+            {'selector': 'td', 'props': [
+                ('border', '2px solid black'),
+                ('padding', '5px')
+            ]}
+        ])
+        .to_html(escape=False)
+    )
+    return styled_table
+
+# @app.get("/get_table_data/")
+# @app.get("/get_table_data")
+# async def get_table_data(
+#     request:Request,
+
+#     table_name: str = Query(...),
+#     page_number: int = Query(1),
+#     records_per_page: int = Query(10),
+# ):
+#     """Fetch paginated and styled table data."""
+#     try:
+#         # Check if the requested table exists in the tables_data from the initial response
+#         if "tables_data" not in request.query_params or table_name not in request.query_params["tables_data"]:
+#             raise HTTPException(status_code=404, detail=f"Table {table_name} data not found.")
+
+#         # Retrieve the data for the specified table from the query params
+#         data = request.query_params["tables_data"][table_name]
+#         total_records = len(data)
+#         total_pages = (total_records + records_per_page - 1) // records_per_page
+
+#         # Ensure valid page number
+#         if page_number < 1 or page_number > total_pages:
+#             raise HTTPException(status_code=400, detail="Invalid page number.")
+
+#         # Slice data for the requested page
+#         start_index = (page_number - 1) * records_per_page
+#         end_index = start_index + records_per_page
+#         page_data = data.iloc[start_index:end_index]
+
+#         # Style the table as HTML
+#         styled_table = (
+#             page_data.style.set_table_attributes('style="border: 2px solid black; border-collapse: collapse;"')
+#             .set_table_styles([
+#                 {'selector': 'th', 'props': [('background-color', '#333'), ('color', 'white'), ('font-weight', 'bold'), ('font-size', '16px')]},
+#                 {'selector': 'td', 'props': [('border', '2px solid black'), ('padding', '5px')]},
+#             ])
+#             .to_html(escape=False)  # Render as HTML
+#         )
+
+#         return {
+#             "table_html": styled_table,
+#             "page_number": page_number,
+#             "total_pages": total_pages,
+#             "total_records": total_records,
+#         }
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Error generating table data: {str(e)}")
+class QuestionTypeRequest(BaseModel):
+    question_type: str
+@app.post("/set-question-type")
+async def set_question_type(payload: QuestionTypeRequest, request: Request,
+            session_data: dict = Depends(get_session_data_dep),
+            redis_client = Depends(get_redis_client),
+            session_id: str = Depends(get_session_id_dep)
+            ):
+    current_question_type = payload.question_type
+    filename = "generic_prompt.yaml" if current_question_type == "generic" else "chatbot_prompt.yaml"
+    prompts = load_prompts(filename)
+    session_data["current_question_type"] = current_question_type
+    # request.session["prompts"] = prompts  # If you want to store prompts per session
+    user_oid = await resolve_user_oid(redis_client, session_id, session_data)
+
+    if not user_oid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    await cache_response(
+        redis_client,
+        key=f"user::{user_oid}",
+        data=session_data,
+    )
+
+    print("Received question type:", current_question_type)
+    return JSONResponse(content={"message": "Question type set", "prompts": prompts})
+
+#azure-redis integration
+def get_user_oid(session_data: dict) -> str | None:
+    user = session_data.get("user")
+    if not user:
+        return None
+    return user.get("oid")  # Azure AD Object ID
+def get_user_cache_key(user_oid: str, suffix: str = ""):
+    base = f"user::{user_oid}"
+    return f"{base}::{suffix}" if suffix else base
+async def resolve_user_oid(
+    redis_client,
+    session_id: str,
+    session_data: dict | None = None
+) -> str | None:
+    # 1️⃣ Check session pointer
+    cookie_session = await get_cached_response(
+        redis_client, f"session::{session_id}"
+    ) or {}
+
+    if "user_oid" in cookie_session:
+        return cookie_session["user_oid"]
+
+    # 2️⃣ Fallback from user cache
+    if session_data and "user" in session_data:
+        return session_data["user"].get("oid")
+
+    return None

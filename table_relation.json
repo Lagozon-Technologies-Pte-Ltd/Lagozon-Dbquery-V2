@@ -1,0 +1,44 @@
+{
+  "relations": [
+    {
+      "type": "one_to_many",
+      "source": "Ponpure_LeadDetails",
+      "target": "Ponpure_Quotationhdrs",
+      "source_key": "enquiry_id",
+      "target_key": "enquiry_id",
+      "description": "Each lead or enquiry can generate multiple quotations."
+    },
+    {
+      "type": "one_to_many",
+      "source": "Ponpure_Quotationhdrs",
+      "target": "Ponpure_SaleorderHdrs",
+      "source_key": "quotation_number",
+      "target_key": "quotation_number",
+      "description": "A quotation can be converted into one or more sales orders (system-supported, though typically one)."
+    },
+    {
+      "type": "one_to_many",
+      "source": "Ponpure_SaleorderHdrs",
+      "target": "Ponpure_SaleOrderDtls",
+      "source_key": "header_id",
+      "target_key": "header_id",
+      "description": "A sales order header contains multiple sales order line items."
+    },
+    {
+      "type": "one_to_many",
+      "source": "Ponpure_SaleOrderDtls",
+      "target": "Ponpure_Schedules",
+      "source_key": "line_id",
+      "target_key": "sale_order_detail_line_id",
+      "description": "Each sales order line item can have multiple delivery schedules."
+    },
+    {
+      "type": "one_to_many",
+      "source": "Ponpure_Schedules",
+      "target": "Ponpure_DispatchDetails",
+      "source_key": "line_id",
+      "target_key": "schedule_line_id",
+      "description": "Each schedule line can have one or more dispatches recorded against it."
+    }
+  ]
+}
