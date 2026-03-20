@@ -1022,11 +1022,19 @@ function createSessionElement(session) {
         displayTitle = displayTitle.substring(0, 40) + '...';
     }
     
+    // Use the formatted date and time from backend
+    const dateStr = session.created_at_date || 'Unknown date';
+    const timeStr = session.created_at_time || '';
+    const fullDateTime = session.created_at_full || `${dateStr} ${timeStr}`;
+    
     div.innerHTML = `
         <i class="fas fa-comment"></i>
         <div class="session-content">
             <div class="session-title">${displayTitle}</div>
-            <div class="session-time">${formatTime(session.timestamp || session.created_at)}</div>
+            <div class="session-time">
+                <span class="session-date">${dateStr}</span>
+                <span class="session-time-value">${timeStr}</span>
+            </div>
         </div>
     `;
     
@@ -1036,6 +1044,61 @@ function createSessionElement(session) {
     });
     
     return div;
+}
+
+// Simple date formatter - just returns the date string
+function formatDateTime(timestamp) {
+    try {
+        if (!timestamp) {
+            return new Date().toLocaleString('en-US', { 
+                month: 'short', 
+                day: 'numeric', 
+                year: 'numeric',
+                hour: '2-digit', 
+                minute: '2-digit'
+            });
+        }
+        
+        let date;
+        if (typeof timestamp === 'string') {
+            date = new Date(timestamp);
+            if (isNaN(date.getTime())) {
+                date = new Date(parseInt(timestamp));
+            }
+        } else if (typeof timestamp === 'number') {
+            if (timestamp < 10000000000) {
+                date = new Date(timestamp * 1000);
+            } else {
+                date = new Date(timestamp);
+            }
+        } else {
+            date = new Date();
+        }
+        
+        if (isNaN(date.getTime())) {
+            date = new Date();
+        }
+        
+        // Return formatted date and time
+        return date.toLocaleString('en-US', { 
+            month: 'short', 
+            day: 'numeric', 
+            year: 'numeric',
+            hour: '2-digit', 
+            minute: '2-digit',
+            hour12: true
+        });
+        
+    } catch (error) {
+        console.error("Error formatting date:", error);
+        return new Date().toLocaleString('en-US', { 
+            month: 'short', 
+            day: 'numeric', 
+            year: 'numeric',
+            hour: '2-digit', 
+            minute: '2-digit'
+        });
+    }
 }
 
 function formatTime(timestamp) {

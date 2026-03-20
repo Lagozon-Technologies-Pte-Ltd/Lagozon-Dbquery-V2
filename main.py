@@ -1249,6 +1249,7 @@ async def submit_query(
 
 # Replace APIRouter with direct app.post
 @app.get("/sessions")
+@app.get("/sessions")
 async def list_sessions(
     redis_client=Depends(get_redis_client),
     session_id: str = Depends(get_session_id_dep),
@@ -1269,9 +1270,12 @@ async def list_sessions(
         if not data:
             continue
 
-        created_at = data.get("created_at", 0)
+        # Get timestamp - use created_at if available
+        created_at = data.get("created_at", int(time.time()))
+        
         messages = data.get("messages", [])
 
+        # Generate title from first user message
         title = "New chat"
         if messages:
             first_user_msg = next(
@@ -1281,26 +1285,32 @@ async def list_sessions(
             if first_user_msg:
                 title = " ".join(first_user_msg.split()[:4])
 
+        # Convert timestamp to datetime object for formatting
+        if isinstance(created_at, (int, float)):
+            dt = datetime.fromtimestamp(created_at)
+        else:
+            dt = datetime.now()
+
         sessions.append({
             "session_id": sid,
-            "created_at": data.get("created_at"),
+            "created_at": created_at,
+            "created_at_date": dt.strftime("%d %b %Y"),  # e.g., "21 Jan 2026"
+            "created_at_time": dt.strftime("%I:%M %p"),  # e.g., "02:30 PM"
+            "created_at_full": dt.strftime("%d %b %Y %I:%M %p"),  # Full format
             "count": len(messages),
             "title": title
         })
 
-    # 🔽 Oldest → Newest (so numbering is stable)
+    # Sort by created_at (oldest first)
     sessions.sort(key=lambda x: x["created_at"] or 0)
 
-    # 🏷️ Assign session numbers + labels
+    # Add session numbers
     for idx, s in enumerate(sessions, start=1):
-        date_str = datetime.fromtimestamp(
-            s["created_at"]
-        ).strftime("%d %b %Y")
-
         s["session_number"] = idx
-        s["label"] = f"{date_str} : Session {idx}"
+        s["label"] = f"Session {idx}"
 
     return sessions
+
 @app.get("/sessions/{session_id}")
 async def load_session(
     session_id: str,

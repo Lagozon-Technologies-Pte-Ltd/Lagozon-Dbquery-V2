@@ -1931,3 +1931,26 @@ input:checked + .slider:before {
 .query-section[data-section-type="sql"] {
     order: 3;
 }
+
+.session-time {
+    display: flex;
+    flex-direction: column;
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.4;
+}
+
+.session-date {
+    font-weight: 500;
+    color: var(--accent-color);
+}
+
+.session-time-value {
+    opacity: 0.8;
+}
+
+/* For active session item */
+.session-item.active .session-date,
+.session-item.active .session-time-value {
+    color: white;
+}
